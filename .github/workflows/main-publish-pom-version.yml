@@ -1,0 +1,331 @@
+name: Main — build & publish POM version (SNAPSHOT/RELEASE)
+
+on:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITHUB_PACKAGES_URL: https://maven.pkg.github.com/${{ github.repository }}
+  JAVA_VERSION: "21"
+  JAVA_DISTRIBUTION: "temurin"
+
+jobs:
+  prepare:
+    name: Prepare POM version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4.1.1
+      - uses: actions/setup-java@v4.0.0
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      - id: vars
+        name: Read version from POM
+        run: |
+          VER=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.5.1:exec)
+          echo "version=${VER}" >> $GITHUB_OUTPUT
+          echo "Publishing version ${VER}"
+
+  macos:
+    name: macOS (x86_64 + arm64)
+    runs-on: macos-14
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4.1.1
+      - uses: actions/setup-java@v4.0.0
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      - name: Make scripts executable
+        run: |
+          if git ls-files | grep -E "src/main/scripts/.*\\.sh$" | head -1; then
+            git ls-files | grep -E "src/main/scripts/.*\\.sh$" | xargs chmod +x
+          else
+            echo "No shell scripts found to make executable"
+          fi
+      - name: Build packages
+        run: mvn -B -DskipTests -pl modules/agent package
+      - name: Upload native jars
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: native-macos
+          path: "**/target/*-mac_*.jar"
+
+  linux-x:
+    name: Linux (x86_32 + x86_64 + aarch64 cross)
+    runs-on: ubuntu-22.04
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4.1.1
+      - uses: actions/setup-java@v4.0.0
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      - name: Install cross-compilation tools
+        run: |
+          set -euo pipefail
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+
+          # Install 32-bit support step by step
+          echo "Installing 32-bit development libraries..."
+          sudo apt-get install -y libc6-dev:i386 || echo "Could not install libc6-dev:i386"
+
+          echo "Installing multilib GCC..."
+          sudo apt-get install -y gcc-multilib g++-multilib || {
+            echo "multilib installation failed, trying alternative approach"
+            # Alternative: install 32-bit libraries manually
+            sudo apt-get install -y libc6-dev-i386 lib32gcc-s1 lib32stdc++6
+          }
+
+          # Install ARM64 cross-compilation tools
+          echo "Installing ARM64 cross-compilation tools..."
+          if ! sudo apt-get install -y crossbuild-essential-arm64; then
+            echo "Fallback: Installing explicit aarch64 packages"
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
+
+          # Verify installations
+          echo "=== Verifying toolchains ==="
+          echo "32-bit GCC test:"
+          if echo 'int main(){}' | gcc -m32 -x c - -o /dev/null 2>/dev/null; then
+            echo "✓ 32-bit compilation works"
+            gcc -m32 --version | head -1
+          else
+            echo "✗ 32-bit compilation failed"
+          fi
+
+          echo "ARM64 GCC test:"
+          aarch64-linux-gnu-gcc --version | head -1 || { echo "ARM64 cross-compiler not available"; exit 1; }
+
+      - name: Make scripts executable
+        run: |
+          if git ls-files | grep -E "src/main/scripts/.*\\.sh$" | head -1; then
+            git ls-files | grep -E "src/main/scripts/.*\\.sh$" | xargs chmod +x
+          else
+            echo "No shell scripts found to make executable"
+          fi
+      - name: Build x86 packages
+        run: mvn -B -DskipTests -pl modules/agent package
+      - name: Build ARM64 package (cross-compilation)
+        run: mvn -B -DskipTests -pl modules/agent -Dlinux.arm64.cross=true package
+      - name: Upload native jars
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: native-linux
+          path: |
+            **/target/*-linux_x86_*.jar
+            **/target/*-linux_aarch64.jar
+
+  windows-x86:
+    name: Windows (x86 + x64)
+    runs-on: windows-latest
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4.1.1
+      - uses: actions/setup-java@v4.0.0
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      - name: Install MinGW (32/64)
+        shell: powershell
+        run: |
+          choco install mingw --yes --no-progress
+          echo "C:\\ProgramData\\chocolatey\\lib\\mingw\\tools\\install\\mingw64\\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\\ProgramData\\chocolatey\\lib\\mingw\\tools\\install\\mingw32\\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build packages
+        shell: bash
+        run: mvn -B -DskipTests -pl modules/agent package
+      - name: Upload native jars
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: native-windows-x86
+          path: "**/target/*-windows_x86_*.jar"
+
+  deploy-reactor:
+    name: Deploy non-agent modules
+    needs: [prepare, macos, linux-x, windows-x86]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.1.1
+      - uses: actions/setup-java@v4.0.0
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      - name: Setup Maven settings for GitHub Packages
+        run: |
+          mkdir -p $HOME/.m2
+          cat > $HOME/.m2/settings.xml <<'XML'
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0
+                                       https://maven.apache.org/xsd/settings-1.2.0.xsd">
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${env.GITHUB_ACTOR}</username>
+                <password>${env.GITHUB_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          XML
+      - name: Ensure reactor version (no-op if already same)
+        run: mvn -q -DnewVersion="${{ needs.prepare.outputs.version }}" -DgenerateBackupPoms=false versions:set
+      - name: Deploy all non-agent modules
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mvn -B -DskipTests -pl '!modules/agent' -DaltDeploymentRepository=github::${{ env.GITHUB_PACKAGES_URL }} deploy
+
+  publish-agent-classifiers:
+    name: Publish agent POM + native classifiers
+    needs: [prepare, macos, linux-x, windows-x86, deploy-reactor]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.1.1
+      - uses: actions/setup-java@v4.0.0
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      - name: Setup Maven settings for GitHub Packages
+        run: |
+          mkdir -p $HOME/.m2
+          cat > $HOME/.m2/settings.xml <<'XML'
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0
+                                       https://maven.apache.org/xsd/settings-1.2.0.xsd">
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${env.GITHUB_ACTOR}</username>
+                <password>${env.GITHUB_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          XML
+      - uses: actions/download-artifact@v4.1.1
+        with:
+          path: dist
+      - name: Deploy agent POM + classifier jars
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          V="${{ needs.prepare.outputs.version }}"
+
+          if [ ! -d "modules/agent" ]; then
+            echo "Error: modules/agent directory not found"
+            exit 1
+          fi
+
+          pushd modules/agent >/dev/null
+          G=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.groupId}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.5.1:exec)
+          A=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.artifactId}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.5.1:exec)
+
+          if [ ! -f "pom.xml" ]; then
+            echo "Error: pom.xml not found in modules/agent"
+            exit 1
+          fi
+
+          # Create a dummy main JAR
+          echo "Creating dummy main JAR"
+          mkdir -p target
+          echo "# This is a dummy JAR - native libraries are provided as classifiers" > target/README.txt
+          jar cf "target/${A}-${V}.jar" -C target README.txt
+
+          # Copy all classifier JARs to target and build deployment parameters
+          echo "Copying classifier JARs to target directory"
+          CLASSIFIER_JARS=$(find ../../dist -type f \( -name "*-mac_*.jar" -o -name "*-linux_*.jar" -o -name "*-windows_*.jar" \) | grep "$A-")
+
+          FILES=""
+          CLASSIFIERS=""
+          TYPES=""
+
+          if [ -n "$CLASSIFIER_JARS" ]; then
+            echo "Found classifier JARs:"
+            echo "$CLASSIFIER_JARS"
+
+            for J in $CLASSIFIER_JARS; do
+              if [ -n "$J" ] && [ -f "$J" ]; then
+                BN=$(basename "$J")
+                # Extract classifier from filename: artifact-version-classifier.jar
+                NAME_NO_JAR=${BN%.jar}
+                CLASSIFIER="${NAME_NO_JAR#${A}-${V}-}"
+
+                if [ -z "$CLASSIFIER" ] || [ "$CLASSIFIER" = "$NAME_NO_JAR" ]; then
+                  echo "Warning: Could not extract classifier from $BN, skipping"
+                  continue
+                fi
+
+                # Copy to target directory
+                cp "$J" "target/${BN}"
+                echo "Copied $BN with classifier: $CLASSIFIER"
+
+                # Build comma-separated parameter lists
+                if [ -z "$FILES" ]; then
+                  FILES="target/${BN}"
+                  CLASSIFIERS="$CLASSIFIER"
+                  TYPES="jar"
+                else
+                  FILES="${FILES},target/${BN}"
+                  CLASSIFIERS="${CLASSIFIERS},${CLASSIFIER}"
+                  TYPES="${TYPES},jar"
+                fi
+              fi
+            done
+          fi
+
+          # Deploy main JAR with POM and all classifiers in a single command
+          if [ -n "$FILES" ]; then
+            echo "Deploying ${G}:${A}:${V} with classifiers: $CLASSIFIERS"
+            mvn -B -q deploy:deploy-file \
+              -DrepositoryId=github -Durl="${{ env.GITHUB_PACKAGES_URL }}" \
+              -DgroupId="$G" -DartifactId="$A" -Dversion="$V" \
+              -Dpackaging=jar \
+              -Dfile="target/${A}-${V}.jar" \
+              -DpomFile=pom.xml \
+              -Dfiles="$FILES" \
+              -Dclassifiers="$CLASSIFIERS" \
+              -Dtypes="$TYPES"
+          else
+            echo "No classifier JARs found, deploying only main JAR and POM"
+            mvn -B -q deploy:deploy-file \
+              -DrepositoryId=github -Durl="${{ env.GITHUB_PACKAGES_URL }}" \
+              -DgroupId="$G" -DartifactId="$A" -Dversion="$V" \
+              -Dpackaging=jar \
+              -Dfile="target/${A}-${V}.jar" \
+              -DpomFile=pom.xml
+          fi
+
+          popd >/dev/null
+      - name: Create distribution bundle
+        run: |
+          mkdir -p dist/bundle
+          find dist -type f -name "*.jar" -exec cp -t dist/bundle {} + 2>/dev/null || echo "No JARs found to bundle"
+          if [ -d "dist/bundle" ] && [ "$(ls -A dist/bundle)" ]; then
+            (cd dist && zip -r faketime-native-${{ needs.prepare.outputs.version }}-${{ github.sha }}.zip bundle)
+          else
+            echo "No files to bundle, creating empty archive"
+            (cd dist && zip faketime-native-${{ needs.prepare.outputs.version }}-${{ github.sha }}.zip -T)
+          fi
+      - uses: actions/upload-artifact@v4.3.1
+        with:
+          name: faketime-native-${{ needs.prepare.outputs.version }}-${{ github.sha }}
+          path: dist/faketime-native-${{ needs.prepare.outputs.version }}-${{ github.sha }}.zip
